@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Mock safety tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - run: make check test
+      - name: Verify installation and completion
+        run: |
+          stage=$(mktemp -d)
+          make install DESTDIR="$stage" PREFIX=/usr
+          test "$("$stage/usr/bin/easydd" --version)" = "easydd $(cat VERSION)"
+          "$stage/usr/bin/easydd" --help
+          zsh -fc 'fpath=("$1" $fpath); autoload -Uz compinit; compinit -D -i; [[ ${_comps[easydd]} == _easydd ]]' -- "$stage/usr/share/zsh/site-functions"
+      - name: Smoke-test public Homebrew installation
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          brew tap vijitsingh97/easydd https://github.com/VijitSingh97/easydd.git
+          brew install vijitsingh97/easydd/easydd
+          brew test vijitsingh97/easydd/easydd

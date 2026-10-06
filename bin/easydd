@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Write a raw image to an explicitly confirmed external macOS disk."""
+import argparse
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+
+VERSION = "0.0.1"
+DISKUTIL = "/usr/sbin/diskutil"
+WHOLE_DISK = re.compile(r"disk[0-9]+\Z")
+PARTITION = re.compile(r"/dev/disk[0-9]+(?:s[0-9]+)*\Z")
+
+
+class Error(Exception):
+    pass
+
+
+def command(args, **kwargs):
+    try:
+        return subprocess.run(args, check=True, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        raise Error(f"Command failed: {args[0]} (exit {exc.returncode}).") from exc
+
+
+def diskutil(*args):
+    result = command([DISKUTIL, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        data = plistlib.loads(result.stdout)
+    except (ValueError, plistlib.InvalidFileException) as exc:
+        raise Error("Cannot read disk information; refusing to write.") from exc
+    if not isinstance(data, dict) or data.get("Error"):
+        raise Error("Cannot read disk information; refusing to write.")
+    return data
+
+
+def info(device):
+    return diskutil("info", "-plist", device)
+
+
+def backing_disks(volume):
+    """Resolve APFS physical stores, or a directly backed physical volume."""
+    stores = volume.get("APFSPhysicalStores")
+    if stores:
+        if not isinstance(stores, list) or not all(isinstance(store, dict) for store in stores):
+            raise Error("Incomplete APFS storage information; refusing to write.")
+        devices = [store.get("APFSPhysicalStore") for store in stores]
+    elif volume.get("VirtualOrPhysical") == "Physical":
+        devices = [volume.get("ParentWholeDisk") or volume.get("DeviceIdentifier")]
+    else:
+        raise Error("Cannot determine the physical startup/source disk; refusing to write.")
+    protected = set()
+    for device in devices:
+        if not isinstance(device, str) or not PARTITION.fullmatch("/dev/" + device):
+            raise Error("Incomplete disk information; refusing to write.")
+        store = info("/dev/" + device)
+        whole = store.get("ParentWholeDisk") or store.get("DeviceIdentifier")
+        if store.get("VirtualOrPhysical") != "Physical" or not WHOLE_DISK.fullmatch(whole or ""):
+            raise Error("Unsupported virtual startup/source storage; refusing to write.")
+        protected.add(whole)
+    return protected
+
+
+def protected_disks(image):
+    protected = backing_disks(info("/"))
+    rows = command(["/bin/df", "-P", str(image)], stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE, text=True).stdout.splitlines()
+    device = rows[1].split()[0] if len(rows) == 2 and rows[1].split() else ""
+    if not PARTITION.fullmatch(device):
+        raise Error("Cannot determine the image's source disk; use a local physical drive.")
+    return protected | backing_disks(info(device))
+
+
+def eligible_disks(image, image_size):
+    protected = protected_disks(image)
+    listing = diskutil("list", "-plist", "external", "physical")
+    records = listing.get("AllDisksAndPartitions")
+    whole_disks = listing.get("WholeDisks")
+    if not isinstance(records, list) or not isinstance(whole_disks, list) or not all(
+            isinstance(entry, dict) for entry in records):
+        raise Error("Incomplete external disk list; refusing to write.")
+    entries = {entry.get("DeviceIdentifier") for entry in records}
+    candidates = []
+    for identifier in whole_disks:
+        if not isinstance(identifier, str) or not WHOLE_DISK.fullmatch(identifier):
+            raise Error("Invalid external disk list; refusing to write.")
+        if identifier in protected or identifier not in entries:
+            continue
+        details = info("/dev/" + identifier)
+        size = details.get("TotalSize")
+        block_size = details.get("DeviceBlockSize")
+        if (details.get("DeviceIdentifier") == identifier
+                and details.get("DeviceNode") == "/dev/" + identifier
+                and details.get("WholeDisk") is True
+                and details.get("VirtualOrPhysical") == "Physical"
+                and details.get("Internal") is False
+                and details.get("OSInternalMedia") is not True
+                and details.get("RemovableMediaOrExternalDevice") is True
+                and details.get("WritableMedia") is True
+                and type(size) is int and size >= image_size
+                and type(block_size) is int and block_size > 0
+                and image_size % block_size == 0):
+            candidates.append(details)
+    return candidates
+
+
+def identity(disk):
+    return tuple(disk.get(key) for key in (
+        "DeviceIdentifier", "DeviceNode", "TotalSize", "DeviceBlockSize",
+        "MediaName", "BusProtocol", "DeviceTreePath", "MediaUUID", "DiskUUID"))
+
+
+def recheck(selected, image, image_size):
+    # ponytail: diskutil cannot lock hardware; keep the target connected until dd exits.
+    for disk in eligible_disks(image, image_size):
+        if identity(disk) == identity(selected):
+            return
+    raise Error("The selected disk changed or is no longer safe; refusing to write.")
+
+
+def label(value):
+    return "".join(char if char.isprintable() else "?" for char in str(value))
+
+
+def size_label(size):
+    return f"{size / 1_000_000_000:.2f} GB"
+
+
+def validate_image(image):
+    if image.suffix.lower() not in (".img", ".iso"):
+        raise Error("Invalid file type. Use an uncompressed raw .img or .iso image.")
+    source = os.fdopen(os.open(image, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW), "rb", buffering=0)
+    metadata = os.fstat(source.fileno())
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size == 0 or metadata.st_size % 512:
+        source.close()
+        raise Error("The image must be a nonempty regular file aligned to 512-byte sectors.")
+    header = source.read(512)
+    source.seek(-512, os.SEEK_END)
+    trailer = source.read(4)
+    source.seek(0)
+    if (header.startswith((b"\x1f\x8b", b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08",
+                          b"BZh", b"\xfd7zXZ\x00", b"\x28\xb5\x2f\xfd", b"7z\xbc\xaf\x27\x1c",
+                          b"Rar!\x1a\x07", b"sprs"))
+            or header[257:262] == b"ustar" or trailer == b"koly"):
+        source.close()
+        raise Error("Archives and DMG containers are unsupported; use a raw image.")
+    return source, metadata
+
+
+def write_image(source, image_size, raw_device, pv):
+    reader = subprocess.Popen([pv, "--progress", "--timer", "--eta", "--rate", "--bytes",
+                               "--size", str(image_size), "--stop-at-size"],
+                              stdin=source, stdout=subprocess.PIPE)
+    writer = None
+    try:
+        writer = subprocess.Popen(["/usr/bin/sudo", "-n", "/bin/dd", f"of={raw_device}",
+                                   "bs=4m", "iflag=fullblock", "conv=fsync"], stdin=reader.stdout)
+        reader.stdout.close()
+        writer_status = writer.wait()
+        reader_status = reader.wait()
+        if writer_status or reader_status:
+            raise Error("Write failed. The target may contain an incomplete image.")
+    finally:
+        # Do not return the terminal while privileged dd may still be writing.
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            reader.stdout.close()
+            if reader.poll() is None:
+                try:
+                    reader.terminate()
+                except ProcessLookupError:
+                    pass  # pv exited between poll and terminate.
+                reader.wait()
+            if writer is not None:
+                writer.wait()
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Write a raw image to a confirmed external macOS disk.")
+    parser.add_argument("--version", action="version", version=f"easydd {VERSION}")
+    parser.add_argument("image", type=Path, help="uncompressed .img or .iso file")
+    args = parser.parse_args()
+    if sys.platform != "darwin":
+        raise Error("easydd supports macOS only.")
+    if os.geteuid() == 0:
+        raise Error("Run easydd as your normal user; it requests sudo only for the write.")
+    image = args.image.absolute()
+    with_source, metadata = validate_image(image)
+    with with_source as source:
+        pv = shutil.which("pv")
+        if not pv:
+            raise Error("Progress support is missing. Install it with: brew install pv")
+        if not sys.stdin.isatty():
+            raise Error("Run easydd in an interactive terminal.")
+        disks = eligible_disks(image, metadata.st_size)
+        if not disks:
+            raise Error("No eligible external disks. Targets must be writable, large enough, and separate from the startup/source disks.")
+        print(f"Image: {label(image)} ({size_label(metadata.st_size)})\n")
+        for number, disk in enumerate(disks, 1):
+            print(f"{number}. {label(disk.get('MediaName') or 'External disk')} | "
+                  f"{size_label(disk['TotalSize'])} | {disk['DeviceNode']} | "
+                  f"{label(disk.get('BusProtocol') or 'External')}")
+        while True:
+            answer = input("\nSelect disk number (q to cancel): ").strip()
+            if answer.lower() == "q":
+                print("Cancelled.")
+                return
+            if answer.isdecimal() and 1 <= int(answer) <= len(disks):
+                selected = disks[int(answer) - 1]
+                break
+            print("Choose a number from the list, or q.")
+        device = selected["DeviceNode"]
+        print(f"\nALL DATA on {device} ({label(selected.get('MediaName'))}, "
+              f"{size_label(selected['TotalSize'])}) will be erased.")
+        if input(f"Type {device} to confirm: ").strip() != device:
+            print("Cancelled.")
+            return
+        command(["/usr/bin/sudo", "-v"])
+        recheck(selected, image, metadata.st_size)
+        current = image.stat()
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+                metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns):
+            raise Error("The image changed after selection; refusing to write.")
+        command([DISKUTIL, "unmountDisk", device])
+        recheck(selected, image, metadata.st_size)
+        print("\nWriting image. Keep the disk connected until completion.", flush=True)
+        write_image(source, metadata.st_size, "/dev/r" + selected["DeviceIdentifier"], pv)
+        final = os.fstat(source.fileno())
+        if (final.st_size, final.st_mtime_ns) != (metadata.st_size, metadata.st_mtime_ns):
+            raise Error("The image changed during writing. The target may contain an incomplete image.")
+        try:
+            command([DISKUTIL, "eject", device])
+        except Error as exc:
+            raise Error("Image written and flushed, but ejection failed. Eject the disk manually before disconnecting.") from exc
+        print(f"Done: {label(image.name)} written to {device}. Disk ejected safely.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (Error, OSError, EOFError, ValueError) as exc:
+        print(f"easydd: {label(exc)}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\neasydd: cancelled; if writing had started, the target may be incomplete.", file=sys.stderr)
+        sys.exit(130)
