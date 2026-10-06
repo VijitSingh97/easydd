@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.2 — 2026-10-06
+
+- Resolve APFS startup and source partitions through their whole physical parents.
+- Use macOS's physical-disk list when partition metadata omits physicality or Apple storage reports `Unknown`.
+- Continue rejecting virtual parents, disk images, and unresolved backing storage.
+
 ## 0.0.1 — 2026-10-06
 
 - Write uncompressed raw `.img` and `.iso` images to external macOS disks.

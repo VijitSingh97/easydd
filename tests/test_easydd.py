@@ -54,6 +54,15 @@ class EasyDDTests(unittest.TestCase):
         result.update(changes)
         return result
 
+    @staticmethod
+    def listing(*identifiers):
+        return {
+            "WholeDisks": list(identifiers),
+            "AllDisksAndPartitions": [
+                {"DeviceIdentifier": identifier} for identifier in identifiers
+            ],
+        }
+
     def test_validate_image_accepts_raw_img_and_iso(self):
         for suffix in (".img", ".ISO"):
             for size in (512, 4096, 8192):
@@ -120,10 +129,14 @@ class EasyDDTests(unittest.TestCase):
             {"APFSPhysicalStore": "disk5s1"},
         ]}
         details = {
-            "/dev/disk0s2": {"VirtualOrPhysical": "Physical", "ParentWholeDisk": "disk0"},
-            "/dev/disk5s1": {"VirtualOrPhysical": "Physical", "ParentWholeDisk": "disk5"},
+            "/dev/disk0s2": {"ParentWholeDisk": "disk0"},
+            "/dev/disk5s1": {"ParentWholeDisk": "disk5"},
+            "/dev/disk0": self.disk("disk0", VirtualOrPhysical="Unknown"),
+            "/dev/disk5": self.disk("disk5", VirtualOrPhysical="Unknown"),
         }
-        with mock.patch.dict(EASY, {"info": mock.Mock(side_effect=lambda device: details[device])}):
+        with mock.patch.dict(EASY, {
+                "diskutil": mock.Mock(return_value=self.listing("disk0", "disk5")),
+                "info": mock.Mock(side_effect=lambda device: details[device])}):
             self.assertEqual(EASY["backing_disks"](volume), {"disk0", "disk5"})
 
     def test_backing_disks_fails_closed_for_unresolved_or_virtual_storage(self):
@@ -134,21 +147,50 @@ class EasyDDTests(unittest.TestCase):
             {"APFSPhysicalStores": [{"APFSPhysicalStore": "not-a-partition"}]},
         )
         for volume in cases:
-            with self.subTest(volume=volume), self.assertRaises(Error):
+            with self.subTest(volume=volume), \
+                    mock.patch.dict(EASY, {"diskutil": mock.Mock(return_value=self.listing())}), \
+                    self.assertRaises(Error):
                 EASY["backing_disks"](volume)
-        with mock.patch.dict(EASY, {"info": mock.Mock(return_value={
-                "VirtualOrPhysical": "Virtual", "ParentWholeDisk": "disk0"})}):
-            with self.assertRaises(Error):
-                EASY["backing_disks"]({"APFSPhysicalStores": [
-                    {"APFSPhysicalStore": "disk0s2"}]})
+        volume = {"APFSPhysicalStores": [{"APFSPhysicalStore": "disk0s2"}]}
+        cases = (
+            ({"DeviceIdentifier": "disk0s2"}, self.listing("disk0")),
+            ({"ParentWholeDisk": "disk0"}, self.listing("disk1")),
+            ({"ParentWholeDisk": "disk0"}, self.listing("disk0"), "Virtual"),
+            ({"ParentWholeDisk": "disk0"}, self.listing("disk0"), "Physical", "Disk Image"),
+        )
+        for case in cases:
+            store, listing, *classification = case
+            parent = self.disk("disk0")
+            if classification:
+                parent["VirtualOrPhysical"] = classification[0]
+            if len(classification) > 1:
+                parent["BusProtocol"] = classification[1]
+            with self.subTest(store=store, parent=parent), mock.patch.dict(EASY, {
+                    "diskutil": mock.Mock(return_value=listing),
+                    "info": mock.Mock(side_effect=lambda device, store=store, parent=parent:
+                                      store if device == "/dev/disk0s2" else parent)}):
+                with self.assertRaises(Error):
+                    EASY["backing_disks"](volume)
+
+    def test_backing_disks_rejects_present_but_empty_apfs_metadata(self):
+        for stores in ([], {}, "", None):
+            volume = {"APFSPhysicalStores": stores, "DeviceIdentifier": "disk0s2"}
+            diskutil = mock.Mock(return_value=self.listing("disk0"))
+            info = mock.Mock(return_value=self.disk("disk0"))
+            with self.subTest(stores=stores), mock.patch.dict(EASY, {
+                    "diskutil": diskutil, "info": info}), self.assertRaises(Error):
+                EASY["backing_disks"](volume)
+            diskutil.assert_not_called()
+            info.assert_not_called()
 
     def test_protected_disks_combines_startup_and_image_source(self):
         image = self.image()
         root = {"APFSPhysicalStores": [{"APFSPhysicalStore": "disk0s2"}]}
-        source = {"VirtualOrPhysical": "Physical", "ParentWholeDisk": "disk4"}
+        source = {"DeviceIdentifier": "disk4s1", "ParentWholeDisk": "disk4"}
         stores = {
-            "/dev/disk0s2": {"VirtualOrPhysical": "Physical", "ParentWholeDisk": "disk0"},
-            "/dev/disk4": source,
+            "/dev/disk0s2": {"ParentWholeDisk": "disk0"},
+            "/dev/disk0": self.disk("disk0", VirtualOrPhysical="Unknown"),
+            "/dev/disk4": self.disk("disk4", VirtualOrPhysical="Unknown"),
         }
 
         def fake_info(device):
@@ -157,18 +199,23 @@ class EasyDDTests(unittest.TestCase):
         df = types.SimpleNamespace(stdout="Filesystem blocks Used Available Capacity Mounted on\n/dev/disk4s1 1 1 0 100% /tmp\n")
         with mock.patch.dict(EASY, {
                 "info": mock.Mock(side_effect=fake_info),
+                "diskutil": mock.Mock(return_value=self.listing("disk0", "disk4")),
                 "command": mock.Mock(return_value=df)}):
             self.assertEqual(EASY["protected_disks"](image), {"disk0", "disk4"})
 
     def test_protected_disks_fails_closed_when_root_or_source_is_unresolved(self):
         image = self.image()
-        with mock.patch.dict(EASY, {"info": mock.Mock(return_value={})}):
+        with mock.patch.dict(EASY, {
+                "info": mock.Mock(return_value={}),
+                "diskutil": mock.Mock(return_value=self.listing())}):
             with self.assertRaises(Error):
                 EASY["protected_disks"](image)
-        root = {"VirtualOrPhysical": "Physical", "DeviceIdentifier": "disk0"}
+        root = {"DeviceIdentifier": "disk0"}
+        parent = self.disk("disk0", VirtualOrPhysical="Unknown")
         invalid_df = types.SimpleNamespace(stdout="Filesystem blocks\nnot-a-device 1\n")
         with mock.patch.dict(EASY, {
-                "info": mock.Mock(return_value=root),
+                "info": mock.Mock(side_effect=lambda device: root if device == "/" else parent),
+                "diskutil": mock.Mock(return_value=self.listing("disk0")),
                 "command": mock.Mock(return_value=invalid_df)}):
             with self.assertRaises(Error):
                 EASY["protected_disks"](image)
@@ -208,15 +255,65 @@ class EasyDDTests(unittest.TestCase):
 
     def test_external_apfs_startup_store_is_never_eligible(self):
         image = self.image()
-        listing = {
-            "WholeDisks": ["disk5"],
-            "AllDisksAndPartitions": [{"DeviceIdentifier": "disk5"}],
+        root = {"APFSPhysicalStores": [
+            {"APFSPhysicalStore": "disk5s2"},
+            {"APFSPhysicalStore": "disk6s2"},
+        ]}
+        details = {
+            "/": root,
+            "/dev/disk0s1": {"DeviceIdentifier": "disk0s1", "ParentWholeDisk": "disk0"},
+            "/dev/disk5s2": {"ParentWholeDisk": "disk5"},
+            "/dev/disk6s2": {"ParentWholeDisk": "disk6"},
+            "/dev/disk0": self.disk("disk0", VirtualOrPhysical="Unknown"),
+            "/dev/disk5": self.disk("disk5", VirtualOrPhysical="Unknown"),
+            "/dev/disk6": self.disk("disk6", VirtualOrPhysical="Unknown"),
+            "/dev/disk9": self.disk("disk9"),
         }
+        df = types.SimpleNamespace(stdout="Filesystem blocks Used Available Capacity Mounted on\n"
+                                           "/dev/disk0s1 1 1 0 100% /tmp\n")
+
+        def fake_diskutil(*args):
+            if args == ("list", "-plist", "physical"):
+                return self.listing("disk0", "disk5", "disk6", "disk9")
+            if args == ("list", "-plist", "external", "physical"):
+                return self.listing("disk5", "disk6", "disk9")
+            if args[:2] == ("info", "-plist"):
+                return details[args[2]]
+            self.fail(f"unexpected diskutil call: {args}")
+
         with mock.patch.dict(EASY, {
-                "protected_disks": mock.Mock(return_value={"disk0", "disk5"}),
-                "diskutil": mock.Mock(return_value=listing),
-                "info": mock.Mock(side_effect=AssertionError("protected disk must not be inspected"))}):
-            self.assertEqual(EASY["eligible_disks"](image, 512), [])
+                "diskutil": fake_diskutil,
+                "command": mock.Mock(return_value=df)}):
+            self.assertEqual(EASY["eligible_disks"](image, 512), [details["/dev/disk9"]])
+
+    def test_realistic_apfs_shapes_protect_startup_and_downloads_source(self):
+        image = self.image()
+        source_parent = self.disk("disk73")
+        del source_parent["VirtualOrPhysical"]
+        details = {
+            "/": {"APFSPhysicalStores": [{"APFSPhysicalStore": "disk42s2"}]},
+            "/dev/disk42s2": {"ParentWholeDisk": "disk42"},
+            "/dev/disk73s1": {"DeviceIdentifier": "disk73s1", "ParentWholeDisk": "disk73"},
+            "/dev/disk42": self.disk("disk42", VirtualOrPhysical="Unknown"),
+            "/dev/disk73": source_parent,
+            "/dev/disk91": self.disk("disk91", MediaName="Regression USB"),
+        }
+        df = types.SimpleNamespace(stdout="Filesystem blocks Used Available Capacity Mounted on\n"
+                                           "/dev/disk73s1 1 1 0 100% /Users/test/Downloads\n")
+
+        def fake_diskutil(*args):
+            if args == ("list", "-plist", "physical"):
+                return self.listing("disk42", "disk73", "disk91")
+            if args == ("list", "-plist", "external", "physical"):
+                return self.listing("disk73", "disk91")
+            if args[:2] == ("info", "-plist"):
+                return details[args[2]]
+            self.fail(f"unexpected diskutil call: {args}")
+
+        with mock.patch.dict(EASY, {
+                "diskutil": fake_diskutil,
+                "command": mock.Mock(return_value=df)}):
+            self.assertEqual(EASY["eligible_disks"](image, 512), [details["/dev/disk91"]])
 
     def test_eligible_disks_rejects_malformed_external_listing(self):
         listing = {

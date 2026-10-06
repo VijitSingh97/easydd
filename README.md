@@ -121,7 +121,7 @@ brew install python@3.13 pv
 export PATH="$(brew --prefix python@3.13)/libexec/bin:$HOME/.local/bin:$PATH"
 git clone https://github.com/VijitSingh97/easydd.git
 cd easydd
-git checkout v0.0.1
+git checkout v0.0.2
 make install PREFIX="$HOME/.local"
 ```
 

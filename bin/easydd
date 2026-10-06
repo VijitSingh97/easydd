@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 DISKUTIL = "/usr/sbin/diskutil"
 WHOLE_DISK = re.compile(r"disk[0-9]+\Z")
 PARTITION = re.compile(r"/dev/disk[0-9]+(?:s[0-9]+)*\Z")
@@ -43,25 +43,45 @@ def info(device):
     return diskutil("info", "-plist", device)
 
 
+def listed_disks(*filters):
+    listing = diskutil("list", "-plist", *filters)
+    records = listing.get("AllDisksAndPartitions")
+    whole_disks = listing.get("WholeDisks")
+    if not isinstance(records, list) or not isinstance(whole_disks, list) or not all(
+            isinstance(entry, dict) for entry in records):
+        raise Error("Incomplete disk list; refusing to write.")
+    entries = {entry.get("DeviceIdentifier") for entry in records}
+    if any(not isinstance(device, str) or not WHOLE_DISK.fullmatch(device) for device in whole_disks):
+        raise Error("Invalid disk list; refusing to write.")
+    return [device for device in whole_disks if device in entries]
+
+
 def backing_disks(volume):
-    """Resolve APFS physical stores, or a directly backed physical volume."""
+    """Protect whole physical parents; APFS partition info can omit physicality."""
     stores = volume.get("APFSPhysicalStores")
-    if stores:
-        if not isinstance(stores, list) or not all(isinstance(store, dict) for store in stores):
+    if "APFSPhysicalStores" in volume:
+        if not isinstance(stores, list) or not stores or not all(
+                isinstance(store, dict) for store in stores):
             raise Error("Incomplete APFS storage information; refusing to write.")
         devices = [store.get("APFSPhysicalStore") for store in stores]
-    elif volume.get("VirtualOrPhysical") == "Physical":
-        devices = [volume.get("ParentWholeDisk") or volume.get("DeviceIdentifier")]
     else:
-        raise Error("Cannot determine the physical startup/source disk; refusing to write.")
+        devices = [volume.get("DeviceIdentifier")]
+    physical = set(listed_disks("physical"))
     protected = set()
     for device in devices:
         if not isinstance(device, str) or not PARTITION.fullmatch("/dev/" + device):
             raise Error("Incomplete disk information; refusing to write.")
         store = info("/dev/" + device)
         whole = store.get("ParentWholeDisk") or store.get("DeviceIdentifier")
-        if store.get("VirtualOrPhysical") != "Physical" or not WHOLE_DISK.fullmatch(whole or ""):
+        if whole not in physical:
             raise Error("Unsupported virtual startup/source storage; refusing to write.")
+        parent = info("/dev/" + whole)
+        if (parent.get("WholeDisk") is not True
+                or parent.get("DeviceIdentifier") != whole
+                or parent.get("DeviceNode") != "/dev/" + whole
+                or parent.get("VirtualOrPhysical") == "Virtual"
+                or parent.get("BusProtocol") == "Disk Image"):
+            raise Error("Cannot verify the physical startup/source disk; refusing to write.")
         protected.add(whole)
     return protected
 
@@ -78,18 +98,9 @@ def protected_disks(image):
 
 def eligible_disks(image, image_size):
     protected = protected_disks(image)
-    listing = diskutil("list", "-plist", "external", "physical")
-    records = listing.get("AllDisksAndPartitions")
-    whole_disks = listing.get("WholeDisks")
-    if not isinstance(records, list) or not isinstance(whole_disks, list) or not all(
-            isinstance(entry, dict) for entry in records):
-        raise Error("Incomplete external disk list; refusing to write.")
-    entries = {entry.get("DeviceIdentifier") for entry in records}
     candidates = []
-    for identifier in whole_disks:
-        if not isinstance(identifier, str) or not WHOLE_DISK.fullmatch(identifier):
-            raise Error("Invalid external disk list; refusing to write.")
-        if identifier in protected or identifier not in entries:
+    for identifier in listed_disks("external", "physical"):
+        if identifier in protected:
             continue
         details = info("/dev/" + identifier)
         size = details.get("TotalSize")
