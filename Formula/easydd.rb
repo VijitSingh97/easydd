@@ -5,13 +5,13 @@ class Easydd < Formula
   sha256 "c96c116380fe1ed4ad7d5f3537580673745e96201da3b3a99520b64f176563e3"
   license "MIT"
 
+  depends_on macos: :sonoma
   depends_on "pv"
   depends_on "python@3.13"
-  depends_on macos: :sonoma
 
   def install
     inreplace "bin/easydd", "#!/usr/bin/env python3",
-              "#!#{Formula["python@3.13"].opt_bin}/python3.13"
+              "#!#{formula_opt_bin("python@3.13")}/python3.13"
     bin.install "bin/easydd"
     zsh_completion.install "completions/_easydd"
   end
