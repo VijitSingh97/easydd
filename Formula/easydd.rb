@@ -1,8 +1,8 @@
 class Easydd < Formula
   desc "Write raw images to external macOS disks with a progress bar"
   homepage "https://github.com/VijitSingh97/easydd"
-  url "https://github.com/VijitSingh97/easydd/archive/refs/tags/v0.0.1.tar.gz"
-  sha256 "c96c116380fe1ed4ad7d5f3537580673745e96201da3b3a99520b64f176563e3"
+  url "https://github.com/VijitSingh97/easydd/archive/refs/tags/v0.0.2.tar.gz"
+  sha256 "9cb352a107d7b6f9c1b57b0943ae77c51aa531d12c4022a73e2f61eb866adc42"
   license "MIT"
 
   depends_on macos: :sonoma
@@ -17,7 +17,7 @@ class Easydd < Formula
   end
 
   test do
-    assert_match "easydd 0.0.1", shell_output("#{bin}/easydd --version")
+    assert_match "easydd 0.0.2", shell_output("#{bin}/easydd --version")
     assert_match "Write a raw image", shell_output("#{bin}/easydd --help")
     (testpath/"invalid.txt").write "This is not a disk image."
     assert_match "Invalid file type", shell_output("#{bin}/easydd #{testpath}/invalid.txt 2>&1", 1)
